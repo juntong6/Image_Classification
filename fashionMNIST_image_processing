@@ -1,0 +1,426 @@
+#The original code was developed by Dr. Sophie Langer. This version is extended by Juntong Chen.
+
+import numpy as np
+import matplotlib.pyplot as plt
+from tensorflow.keras.datasets import fashion_mnist
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import os
+import math
+import csv
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
+import statistics
+from functools import partial
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+# --- Data Loading & Augmentation ---
+def is_full_object_visible(image):
+    """Check if the object is fully visible within the given image boundaries."""
+    rows = np.any(image > 0, axis=1)
+    cols = np.any(image > 0, axis=0)
+    if not np.any(rows) or not np.any(cols):
+        return False
+    min_row, max_row = np.where(rows)[0][[0, -1]]
+    min_col, max_col = np.where(cols)[0][[0, -1]]
+    return (min_row >= 0 and max_row < image.shape[0] and
+            min_col >= 0 and max_col < image.shape[1])
+
+def add_black_border(image, border_width=2):
+    """Adds a black border of specified width to a single image."""
+    height, width = image.shape
+    new_height = height + 2 * border_width
+    new_width = width + 2 * border_width
+    bordered_image = np.zeros((new_height, new_width), dtype=image.dtype)
+    bordered_image[border_width : border_width + height,
+                   border_width : border_width + width] = image
+    return bordered_image
+
+def add_border_to_dataset(images, border_width=2):
+    """Adds a black border to each image in a dataset."""
+    if images.ndim != 3:
+        print("Warning: Input images array should be 3-dimensional (num_images, height, width). Cannot add border.")
+        return images
+
+    num_images, height, width = images.shape
+    new_height = height + 2 * border_width
+    new_width = width + 2 * border_width
+    bordered_images = np.zeros((num_images, new_height, new_width), dtype=images.dtype)
+
+    for i in range(num_images):
+        bordered_images[i] = add_black_border(images[i], border_width)
+
+    return bordered_images
+
+def augment_and_resample(X_class_bordered_template, Y_class, n_samples, datagen, random_brightness_range=[0.05, 20]):
+    """Generate augmented samples with more extreme random brightness."""
+    X_aug, Y_aug = [], []
+    attempts = 0
+    max_attempts = 100 * n_samples
+    brightness_multipliers = []
+
+    if not is_full_object_visible(X_class_bordered_template):
+        print(f"Warning: Input bordered template image for class {Y_class} is not fully visible. Skipping augmentation.")
+        return np.array([]), np.array([])
+
+    X_class_bordered_template_float = X_class_bordered_template.astype(np.float32)
+
+    while len(X_aug) < n_samples and attempts < max_attempts:
+        batch = next(datagen.flow(
+            np.expand_dims(np.expand_dims(X_class_bordered_template_float, axis=0), axis=-1),
+            np.expand_dims(Y_class, axis=0),
+            batch_size=1
+        ))
+
+        img_augmented, label = batch[0][0, :, :, 0], batch[1][0]
+
+        # Apply extreme brightness variation
+        brightness_multiplier = np.random.uniform(random_brightness_range[0], random_brightness_range[1])
+        brightness_multipliers.append(brightness_multiplier)
+        img_brightened = img_augmented * brightness_multiplier
+
+        if is_full_object_visible(img_brightened):
+            X_aug.append(img_brightened)
+            Y_aug.append(label)
+        attempts += 1
+
+    # Print brightness statistics
+    if brightness_multipliers:
+        print(f"Brightness multipliers applied - Min: {min(brightness_multipliers):.2f}, "
+              f"Max: {max(brightness_multipliers):.2f}, "
+              f"Avg: {np.mean(brightness_multipliers):.2f}")
+
+    return np.array(X_aug), np.array(Y_aug)
+
+def generate_data(n_train, n_test, class1, class2, border_width=2, random_brightness_range=[0.05, 20]):
+    """Generate data with extreme brightness variations."""
+    print("Loading Fashion MNIST training data to find templates...")
+    (X_train_full, Y_train_full), (_, _) = fashion_mnist.load_data()
+
+    X1_original_template, Y1 = None, None
+    X2_original_template, Y2 = None, None
+
+    print(f"Finding visible template images for classes {class1} and {class2}...")
+    for i, (img, label) in enumerate(zip(X_train_full, Y_train_full)):
+        if label == class1 and X1_original_template is None and is_full_object_visible(img):
+            X1_original_template, Y1 = img, label
+        if label == class2 and X2_original_template is None and is_full_object_visible(img):
+            X2_original_template, Y2 = img, label
+        if X1_original_template is not None and X2_original_template is not None:
+            break
+
+    if X1_original_template is None or X2_original_template is None:
+        print(f"Error: Could not find visible template images.")
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    print(f"Adding {border_width}-pixel black border to templates...")
+    X1_bordered_template = add_black_border(X1_original_template, border_width)
+    X2_bordered_template = add_black_border(X2_original_template, border_width)
+
+    datagen = ImageDataGenerator(
+        rotation_range=45,
+        brightness_range=[0.5,3],
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        zoom_range=[1.5, 2.5]
+    )
+
+    print("Generating training data with extreme brightness variations...")
+    X_train1, Y_train1 = augment_and_resample(X1_bordered_template, Y1, n_train, datagen, random_brightness_range)
+    X_train2, Y_train2 = augment_and_resample(X2_bordered_template, Y2, n_train, datagen, random_brightness_range)
+
+    print("Generating test data with extreme brightness variations...")
+    X_test1, Y_test1 = augment_and_resample(X1_bordered_template, Y1, n_test, datagen, random_brightness_range)
+    X_test2, Y_test2 = augment_and_resample(X2_bordered_template, Y2, n_test, datagen, random_brightness_range)
+
+    X_train = np.concatenate([arr for arr in [X_train1, X_train2] if arr.size > 0]) if X_train1.size > 0 or X_train2.size > 0 else np.array([])
+    Y_train = np.concatenate([arr for arr in [Y_train1, Y_train2] if arr.size > 0]) if Y_train1.size > 0 or Y_train2.size > 0 else np.array([])
+    X_test = np.concatenate([arr for arr in [X_test1, X_test2] if arr.size > 0]) if X_test1.size > 0 or X_test2.size > 0 else np.array([])
+    Y_test = np.concatenate([arr for arr in [Y_test1, Y_test2] if arr.size > 0]) if Y_test1.size > 0 or Y_test2.size > 0 else np.array([])
+
+    if X_train.size > 0:
+         X_train = X_train.astype(np.float32)
+    if X_test.size > 0:
+         X_test = X_test.astype(np.float32)
+
+    return X_train, Y_train, X_test, Y_test
+
+def visualize_samples(X, Y, class1, class2, title, n_samples=5):
+    """Plot samples with fixed intensity scaling to show true brightness differences"""
+    if X.size == 0:
+        print(f"Warning: No data available to visualize for '{title}'.")
+        return
+
+    fig, axes = plt.subplots(2, n_samples, figsize=(20, 8))
+    fig.suptitle(title, y=1.02)
+    Y = np.array(Y)
+
+    class1_samples = X[Y == class1] if np.any(Y == class1) else np.array([])
+    class2_samples = X[Y == class2] if np.any(Y == class2) else np.array([])
+
+    if len(class1_samples) == 0 or len(class2_samples) == 0:
+         print(f"Warning: Not enough samples from both classes {class1} and {class2}.")
+         plt.close(fig)
+         return
+
+    actual_samples = min(n_samples, len(class1_samples), len(class2_samples))
+
+    # Find global min/max for consistent scaling across all images
+    global_min = min(np.min(class1_samples), np.min(class2_samples))
+    global_max = max(np.max(class1_samples), np.max(class2_samples))
+
+    # If there's extreme brightness variation, cap the max for better visualization
+    if global_max > 255:
+        display_max = 255
+    else:
+        display_max = global_max
+
+    for i in range(actual_samples):
+        img1 = class1_samples[i]
+        brightness1 = np.mean(img1)
+        axes[0, i].imshow(img1, cmap='gray', vmin=global_min, vmax=display_max)
+        axes[0, i].set_title(f"Class {class1}\nMean: {brightness1:.1f}", pad=10)
+        axes[0, i].axis('off')
+
+        img2 = class2_samples[i]
+        brightness2 = np.mean(img2)
+        axes[1, i].imshow(img2, cmap='gray', vmin=global_min, vmax=display_max)
+        axes[1, i].set_title(f"Class {class2}\nMean: {brightness2:.1f}", pad=10)
+        axes[1, i].axis('off')
+
+    for i in range(actual_samples, n_samples):
+        axes[0, i].axis('off')
+        axes[1, i].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# CNN classifiers (unchanged)
+def CNN(X_train, Y_train, X_test, Y_test):
+    """Basic CNN with 1 conv layer, 1 max-pooling, and 1 dense layer."""
+    misclassified_images = []
+    image_dim = X_train[0].shape[0]
+
+    X_train = np.reshape(X_train,(len(X_train), image_dim, image_dim, 1)) / 255.0
+    X_test = np.reshape(X_test,(len(X_test), image_dim, image_dim, 1)) / 255.0
+    Y_train = np.array(Y_train)
+    Y_test = np.array(Y_test)
+
+    model = Sequential([
+        Conv2D(32, (10, 10), activation='relu', input_shape=(image_dim, image_dim, 1)),
+        MaxPooling2D((10, 10)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dense(10, activation='softmax')
+    ])
+
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.fit(X_train, Y_train, epochs=10, batch_size=32, verbose=2)
+
+    misclassification_count = 0
+    for i in range(len(X_test)):
+        pred = model.predict(X_test[i].reshape(1, image_dim, image_dim, 1), verbose=0)
+        predicted_label = np.argmax(pred)
+
+        if predicted_label != Y_test[i]:
+            misclassified_images.append(X_test[i])
+            misclassification_count += 1
+
+    return misclassification_count / len(X_test), misclassified_images
+
+def CNN1(X_train, Y_train, X_test, Y_test):
+    """CNN with 3 conv layers and 1 max-pooling layer."""
+    misclassified_images = []
+    image_dim = X_train[0].shape[0]
+
+    X_train = np.reshape(X_train,(len(X_train), image_dim, image_dim, 1)) / 255.0
+    X_test = np.reshape(X_test,(len(X_test), image_dim, image_dim, 1)) / 255.0
+    Y_train = np.array(Y_train)
+    Y_test = np.array(Y_test)
+
+    model = Sequential([
+        Conv2D(64, (10, 10), activation='relu', input_shape=(image_dim, image_dim, 1)),
+        MaxPooling2D((10, 10)),
+        Flatten(),
+        Dense(256, activation='relu'),
+        Dense(10, activation='softmax')
+    ])
+
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.fit(X_train, Y_train, epochs=10, batch_size=32, verbose=2)
+
+    misclassification_count = 0
+    for i in range(len(X_test)):
+        pred = model.predict(X_test[i].reshape(1, image_dim, image_dim, 1), verbose=0)
+        predicted_label = np.argmax(pred)
+
+        if predicted_label != Y_test[i]:
+            misclassified_images.append(X_test[i])
+            misclassification_count += 1
+
+    return misclassification_count / len(X_test), misclassified_images
+
+def CNN2(X_train, Y_train, X_test, Y_test):
+    """CNN with larger filters and dropout."""
+    misclassified_images = []
+    image_dim = X_train[0].shape[0]
+
+    X_train = np.reshape(X_train,(len(X_train), image_dim, image_dim, 1)) / 255.0
+    X_test = np.reshape(X_test,(len(X_test), image_dim, image_dim, 1)) / 255.0
+    Y_train = np.array(Y_train)
+    Y_test = np.array(Y_test)
+
+    model = Sequential([
+        Conv2D(128, (10, 10), activation='relu', input_shape=(image_dim, image_dim, 1)),
+        MaxPooling2D((10, 10)),
+        Flatten(),
+        Dense(512, activation='relu'),
+        Dense(10, activation='softmax')
+    ])
+
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.fit(X_train, Y_train, epochs=10, batch_size=32, verbose=2)
+
+    misclassification_count = 0
+    for i in range(len(X_test)):
+        pred = model.predict(X_test[i].reshape(1, image_dim, image_dim, 1), verbose=0)
+        predicted_label = np.argmax(pred)
+
+        if predicted_label != Y_test[i]:
+            misclassified_images.append(X_test[i])
+            misclassification_count += 1
+
+    return misclassification_count / len(X_test), misclassified_images
+
+def loss_med(rep, n_train, n_test, num1, num2):
+    """Compute median loss values for CNN estimators."""
+    losses = {1: [], 2: [], 3: []}
+
+    for _ in range(rep):
+        X_train, Y_train, X_test, Y_test = generate_data(n_train, n_test, num1, num2)
+        losses[1].append(CNN(X_train, Y_train, X_test, Y_test)[0])
+        losses[2].append(CNN1(X_train, Y_train, X_test, Y_test)[0])
+        losses[3].append(CNN2(X_train, Y_train, X_test, Y_test)[0])
+
+    results = {}
+    for key in losses:
+        res_median = statistics.median(losses[key])
+        q3, q1 = np.percentile(losses[key], [75, 25])
+        iqr = q3 - q1
+        results[key] = {"median": res_median, "iqr": iqr}
+
+    res1, res2, res3 = (results[i]["median"] for i in range(1, 4))
+    iqr1, iqr2, iqr3 = (results[i]["iqr"] for i in range(1, 4))
+
+    return res1, res2, res3, iqr1, iqr2, iqr3
+
+def summarize_diagnostics(rep, n_test, num1, num2):
+    """
+    Plots the misclassification error curves for the CNN estimators with log scale.
+    Shows exponents (6,7,...) instead of full 2^6, 2^7 notation.
+    """
+    history_cnn1, history_cnn2, history_cnn3 = [], [], []
+    iqr_cnn1, iqr_cnn2, iqr_cnn3 = [], [], []
+
+    # Sample sizes as powers of 2
+    exponents = np.arange(6, 12)  # 2^6 to 2^11 (64 to 2048)
+    sample_sizes = [2**e for e in exponents]
+    half_sample_sizes = [s // 2 for s in sample_sizes]
+
+    for n_train in half_sample_sizes:
+        res1, res2, res3, iqr1, iqr2, iqr3 = loss_med(rep, n_train, n_test, num1, num2)
+        history_cnn1.append(res1)
+        history_cnn2.append(res2)
+        history_cnn3.append(res3)
+        iqr_cnn1.append(iqr1)
+        iqr_cnn2.append(iqr2)
+        iqr_cnn3.append(iqr3)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fashion_mnist_labels = ["T-shirt/top", "Trouser", "Pullover", "Dress", "Coat", "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"]
+    plt.title(f"Missclassification Error: {fashion_mnist_labels[num1]} vs {fashion_mnist_labels[num2]}")
+
+    # Plot with actual sample sizes but log scale
+    ax.plot(sample_sizes, history_cnn1, label='CNN1', marker='o')
+    ax.plot(sample_sizes, history_cnn2, label='CNN2', marker='o')
+    ax.plot(sample_sizes, history_cnn3, label='CNN3', marker='o')
+
+    # Set x-axis to log scale with base 2
+    ax.set_xscale('log', base=2)
+
+    # Custom x-ticks to show just the exponents
+    ax.set_xticks(sample_sizes)
+    ax.set_xticklabels([f'{e}' for e in exponents])
+
+    # Ensure proper spacing between ticks (linear in log space)
+    ax.minorticks_off()
+
+    plt.xlabel('Training Sample Size Exponent (n for 2^n)')
+    plt.ylabel('Missclassification Error')
+    ax.legend()
+    ax.set_ylim(bottom=0)
+    plt.grid(visible=True, linestyle='--', alpha=0.7)
+    plt.savefig('error_plot.png', bbox_inches='tight', dpi=300)
+    plt.show()
+
+    return history_cnn1, history_cnn2, history_cnn3
+
+def save_results_to_csv(history_cnn1, history_cnn2, history_cnn3, sample_sizes):
+    """Save misclassification results to CSV."""
+    import pandas as pd
+    df = pd.DataFrame({
+        'Sample_Size': sample_sizes,
+        'CNN1_Error': history_cnn1,
+        'CNN2_Error': history_cnn2,
+        'CNN3_Error': history_cnn3
+    })
+    df.to_csv('misclassification_results.csv', index=False)
+    print("Results saved to misclassification_results.csv")
+
+def plot_sample_images(X_test_aug, Y_test_aug, num1, num2):
+    """Plot 4 sample images from each class."""
+    fashion_mnist_labels = ["T-shirt/top", "Trouser", "Pullover", "Dress", "Coat", "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"]
+    # Get indices for each class
+    class1_idx = np.where(Y_test_aug == num1)[0][:4]
+    class2_idx = np.where(Y_test_aug == num2)[0][:4]
+
+    # Create figure
+    plt.figure(figsize=(8, 4))
+    plt.suptitle(f'Sample Images: {fashion_mnist_labels[num1]} vs {fashion_mnist_labels[num2]}', y=1.05)
+
+    # Plot class 1 images
+    for i, idx in enumerate(class1_idx):
+        plt.subplot(2, 4, i+1)
+        plt.imshow(X_test_aug[idx], cmap='gray')
+        plt.title(f'{fashion_mnist_labels[num1]}')
+        plt.axis('off')
+
+    # Plot class 2 images
+    for i, idx in enumerate(class2_idx):
+        plt.subplot(2, 4, i+5)
+        plt.imshow(X_test_aug[idx], cmap='gray')
+        plt.title(f'{fashion_mnist_labels[num2]}')
+        plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig('sample_images.png', bbox_inches='tight', dpi=300)
+    plt.show()
+
+if __name__ == "__main__":
+    # Using class 0 (T-shirt/top) and class 3 (Dress)
+    num1, num2 = 0, 3
+
+    # Generate some test data for plotting samples
+    _, _, X_test_sample, Y_test_sample = generate_data(1, 100, num1, num2)
+
+    # Run diagnostics and get results
+    history_cnn1, history_cnn2, history_cnn3 = summarize_diagnostics(10, 100, num1, num2)
+
+    # Save results to CSV
+    sample_sizes = [64,128,256,512,1024,2048]
+    save_results_to_csv(history_cnn1, history_cnn2, history_cnn3, sample_sizes)
+
+    # Plot sample images with proper labels
+    plot_sample_images(X_test_sample, Y_test_sample, num1, num2)
